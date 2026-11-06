@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#0a1114">
+<title>CPU 分布式训练 — JevAny</title><link rel="stylesheet" href="../styles.css"><link rel="icon" href="../assets/favicon.svg" type="image/svg+xml"></head>
+<body class="docs-page"><a class="skip-link" href="#content">Skip to content</a>
+<header class="site-header wrap"><a class="brand" href="../index.html"><img src="../assets/favicon.svg" width="30" height="30" alt=""><span>JevAny<span class="brand-period">.</span></span></a>
+<nav aria-label="Main navigation"><a href="../index.html#benchmarks">Benchmarks</a><a href="../index.html#models">Models</a><a href="../index.html#get-started">Get started</a></nav></header>
+<div class="docs-layout wrap"><aside class="docs-sidebar"><a class="text-link" href="../index.html">← Project homepage</a><nav aria-label="Documentation"><a href="quickstart.html">Quickstart</a><a href="TRAINING.html">Training</a><a href="DATA.html">Data</a><a href="DEPLOYMENT.html">Deployment</a><a href="API.html">API reference</a><a href="examples.html">Examples</a><a href="CASES.html">Cases</a><a href="EVALUATION.html">Evaluation</a><a href="ALGORITHM.html">Method</a><a href="INTEGRATIONS.html">Integrations</a><a href="zh.html">中文文档</a></nav>
+<details class="doc-toc"><summary>On this page</summary><div class="toc">
+<ul>
+<li><a href="#_1">单机多进程</a></li>
+<li><a href="#_2">多机训练</a></li>
+<li><a href="#_3">训练与恢复语义</a></li>
+<li><a href="#_4">验证范围</a></li>
+</ul>
+</div>
+</details></aside>
+<main id="content" class="doc-content"><p class="eyebrow">JEVANY / DOCUMENTATION</p><h1>CPU 分布式训练</h1><p>JevAny 使用同一套 DDP 训练循环支持 CPU 和 CUDA：CPU 使用 Gloo，CUDA 使用 NCCL。
+CPU 路径可用于开发环境中的分布式功能验证，GPU 路径用于后续的 GPU 训练。
+各 worker 必须使用相同的模型、训练数据、训练参数和设备类型。</p>
+<h2 id="_1">单机多进程</h2>
+<p>安装训练依赖并准备入门数据：</p>
+<pre tabindex="0" role="region" aria-label="Code example"><code class="language-bash">python -m pip install -e '.[train]'
+jevany data init --out data/starter
+</code></pre>
+<p>在仓库根目录启动两个 CPU worker：</p>
+<pre tabindex="0" role="region" aria-label="Code example"><code class="language-bash">OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PROCESSES_PER_HOST=2 \
+  bash infra/train.sh --config recipes/sft.toml \
+  --device cpu --dtype fp32 --weights-dtype fp32 \
+  --max-steps 4 --checkpoint-every-steps 2 --out runs/cpu-ddp
+</code></pre>
+<p>也可以直接使用标准入口：</p>
+<pre tabindex="0" role="region" aria-label="Code example"><code class="language-bash">OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  torchrun --standalone --nnodes=1 --nproc-per-node=2 \
+  -m jevany train --config recipes/sft.toml \
+  --device cpu --dtype fp32 --weights-dtype fp32 \
+  --max-steps 4 --checkpoint-every-steps 2 --out runs/cpu-torchrun
+</code></pre>
+<p><code>infra/train.sh</code> 在没有可见 GPU 时默认启动一个进程；有 GPU 时默认按可见 GPU 数量启动。
+CPU 训练应显式设置 <code>PROCESSES_PER_HOST</code>，进程数不受可见 GPU 数量限制。
+设备和精度仍由训练参数决定，使用 CUDA 入门配置时必须覆盖以上三个 CPU 参数。</p>
+<h2 id="_2">多机训练</h2>
+<p>各主机使用相同路径挂载训练数据、基础模型和输出目录。主节点地址必须能被所有 worker 访问，
+并允许 Gloo worker 之间通信。在 Kubernetes 中，输出目录应使用支持跨节点读写的共享卷。</p>
+<p>以下示例使用两台主机，每台一个训练进程。在第一台主机执行：</p>
+<pre tabindex="0" role="region" aria-label="Code example"><code class="language-bash">NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.10 MASTER_PORT=29500 \
+  PROCESSES_PER_HOST=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  bash infra/train.sh --config recipes/sft.toml \
+  --device cpu --dtype fp32 --weights-dtype fp32 \
+  --data /mnt/data/train.jsonl --base-load-path /mnt/base \
+  --max-steps 4 --checkpoint-every-steps 2 --out /mnt/output/cpu-ddp
+</code></pre>
+<p>第二台执行相同命令，将 <code>NODE_RANK</code> 改为 <code>1</code>，<code>MASTER_ADDR</code> 仍指向第一台主机。
+每台主机的进程数保持一致。Gloo 自动选择的网卡不正确时，通过 <code>GLOO_SOCKET_IFNAME</code> 指定网卡。</p>
+<p>Kubeflow Trainer 提供的 <code>PET_*</code> 环境变量由 <code>torchrun</code> 读取。
+Runtime 应使用 <code>torchrun -m jevany train ...</code> 启动，并在 TrainJob 中显式设置每节点进程数。
+仅增加 Pod 数量并直接执行 <code>jevany train</code>，不能组成分布式训练任务。</p>
+<h2 id="_3">训练与恢复语义</h2>
+<ul>
+<li>每个进程保存完整基础模型、LoRA、决策头和本地训练状态，增加进程数不会降低单进程模型内存需求。</li>
+<li><code>--batch</code> 是每进程的微批大小，名义全局有效批大小为 <code>batch × accum × WORLD_SIZE</code>；末尾不足一个累积窗口时按实际记录数归一化。</li>
+<li>数据按进程切分；不能均分时补齐少量记录，补齐数量记录在训练配置和指标中。</li>
+<li>训练损失和计数跨进程汇总，评测结果合并；只有全局 rank 0 保存模型、汇总报告并上报 Kubeflow 进度。</li>
+<li><code>--resume</code> 要求保持原来的设备类型、进程总数、训练参数和数据。恢复时所有 worker 使用相同检查点，<code>--out</code> 指向新的共享目录。</li>
+<li>改变设备类型或进程总数时，可使用 <code>--init-from</code> 加载兼容权重并开始新训练计划。</li>
+<li>任一 worker 失败后当前 DDP 任务应整体结束；重新启动并加载检查点的策略由调用方负责。</li>
+</ul>
+<p>CPU 首轮验证使用 FP32。<code>--dtype bf16</code> 的自动混合精度路径仍只支持 CUDA。
+CPU 与 GPU 镜像分别安装对应的 PyTorch 构建，切换 GPU 时按每张可见 GPU 一个进程分配资源。</p>
+<h2 id="_4">验证范围</h2>
+<p>单机上的 k3d 多节点可以验证跨 Pod 组网、梯度同步、数据切分、评测、模型保存和续训。
+这些节点共享宿主机的 CPU 和内存，不能将各节点上报的容量相加作为物理容量。
+CPU 验证不覆盖 CUDA/NCCL、GPU 显存和真实跨物理机的网络性能，投产前需要在目标 GPU 集群验证。</p></main></div>
+<footer class="site-footer wrap"><a href="../index.html">← Back to JevAny</a><a href="license.html">Apache-2.0 code</a></footer></body></html>

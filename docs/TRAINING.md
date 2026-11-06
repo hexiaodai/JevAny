@@ -31,8 +31,8 @@ jevany train --config recipes/sft.toml \
 ```
 
 CPU training is practical for small experiments, and can be slow. The full frozen backbone,
-adapters, activations and optimizer memory must fit on each device. DDP keeps
-a full model copy on each GPU and increases throughput by distributing records.
+adapters, activations and optimizer memory must fit in each process. DDP keeps
+a full model copy in each process and distributes records across CPU or CUDA workers.
 
 ## Recipes and overrides
 
@@ -137,7 +137,11 @@ Training from `--suite` additionally requires the base revision to be pinned
 by the suite or by `--base-revision`. Full data fields, licenses and the
 release mixtures are documented in [DATA.md](DATA.md).
 
-## Multiple GPUs and hosts
+## Distributed training on CPUs, GPUs and hosts
+
+CPU workers use Gloo; CUDA workers use NCCL. Both use the same DDP training,
+evaluation and checkpoint path. See the [CPU distributed training guide](CPU_DISTRIBUTED.md)
+for local and multi-host CPU launches.
 
 Use one process per visible GPU on a workstation:
 
@@ -150,9 +154,11 @@ The same launcher works inside a scheduler allocation. On every host, set
 Mount the same input data, base weights and output directory on all hosts.
 Keep the GPU visibility assigned by the scheduler.
 
-The launcher defaults to all visible GPUs and prints the process topology.
-Each worker reports its rank, world size, CUDA device and visible device mask.
-When using fewer processes, set `PROCESSES_PER_HOST` and `GPU_SHORTFALL_REASON`.
+The launcher defaults to all visible GPUs, or one process when no GPU is visible,
+and prints the process topology. Set `PROCESSES_PER_HOST` explicitly for CPU
+training, including on hosts with visible GPUs. Each worker reports its rank,
+world size, device and communication backend. CUDA workers also report their
+device binding and visible device mask; training rejects ranks without a visible GPU.
 Check each worker's device binding against the scheduler allocation.
 
 Allocate resources on your workstation or scheduler before running the launcher.
@@ -189,6 +195,40 @@ The final directory contains the adapter, tokenizer, `head.pt`,
 `training_config.json`, `data_admission.json`, and `training_metrics.json`. If early stopping selects a
 different checkpoint, `selection.json` records that path; the root directory
 always holds the final weights. Serve the selected path explicitly.
+
+### Kubeflow Trainer progress
+
+From the JevAny source checkout, install the optional integration in the training image:
+
+```bash
+python -m pip install '.[train,kubeflow]'
+```
+
+Kubeflow Trainer v2.2 or later must have the `TrainJobStatus` feature gate
+enabled. The controller injects the status endpoint, CA certificate and projected
+token into the training container. JevAny detects this configuration and uses
+the official Kubeflow SDK to report progress, estimated remaining seconds and
+the same structured training and evaluation metrics used by W&B. No change to
+the `jevany train` command is required, and W&B can remain disabled.
+
+Only global rank 0 reports status. The percentage uses completed optimizer
+steps and the actual schedule after applying `--max-steps`; resume retains the
+original step count and estimates remaining time from work done in the current
+process. Updates run in a background thread at five-second intervals, so HTTP
+latency does not block optimizer steps. The SDK handles TLS, rotating credentials
+and reporting errors. Missing SDK dependencies produce a warning when the
+controller configuration is present; reporting failures do not change training
+results. Shutdown allows up to eleven seconds for the final status update.
+
+Inspect the latest reported status with:
+
+```bash
+kubectl get trainjob <name> -n <namespace> -o jsonpath='{.status.trainerStatus}'
+```
+
+This status is a latest-value snapshot, not a metric history store. Continue
+using the experiment tracker and saved training artifacts for historical
+analysis. See the [Kubeflow Trainer progress guide](https://trainer.kubeflow.org/en/latest/user-guides/trainjob-progress.html).
 
 ### Resume an interrupted experiment
 

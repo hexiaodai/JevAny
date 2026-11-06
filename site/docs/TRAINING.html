@@ -14,8 +14,9 @@
 </ul>
 </li>
 <li><a href="#data-beyond-the-starter">Data beyond the starter</a></li>
-<li><a href="#multiple-gpus-and-hosts">Multiple GPUs and hosts</a></li>
+<li><a href="#distributed-training-on-cpus-gpus-and-hosts">Distributed training on CPUs, GPUs and hosts</a></li>
 <li><a href="#evaluation-and-checkpoints">Evaluation and checkpoints</a><ul>
+<li><a href="#kubeflow-trainer-progress">Kubeflow Trainer progress</a></li>
 <li><a href="#resume-an-interrupted-experiment">Resume an interrupted experiment</a></li>
 </ul>
 </li>
@@ -49,8 +50,8 @@ device. For a CPU experiment, override the CUDA settings:</p>
   --device cpu --dtype fp32 --weights-dtype fp32 --out runs/cpu-jev
 </code></pre>
 <p>CPU training is practical for small experiments, and can be slow. The full frozen backbone,
-adapters, activations and optimizer memory must fit on each device. DDP keeps
-a full model copy on each GPU and increases throughput by distributing records.</p>
+adapters, activations and optimizer memory must fit in each process. DDP keeps
+a full model copy in each process and distributes records across CPU or CUDA workers.</p>
 <h2 id="recipes-and-overrides">Recipes and overrides</h2>
 <p>Recipes are flat TOML files containing the trainer's argument names. Paths are
 relative to the <strong>current working directory</strong>. Command-line flags override recipe
@@ -148,7 +149,10 @@ jevany train --config recipes/sft.toml \
 Training from <code>--suite</code> additionally requires the base revision to be pinned
 by the suite or by <code>--base-revision</code>. Full data fields, licenses and the
 release mixtures are documented in <a href="DATA.html">DATA.md</a>.</p>
-<h2 id="multiple-gpus-and-hosts">Multiple GPUs and hosts</h2>
+<h2 id="distributed-training-on-cpus-gpus-and-hosts">Distributed training on CPUs, GPUs and hosts</h2>
+<p>CPU workers use Gloo; CUDA workers use NCCL. Both use the same DDP training,
+evaluation and checkpoint path. See the <a href="CPU_DISTRIBUTED.html">CPU distributed training guide</a>
+for local and multi-host CPU launches.</p>
 <p>Use one process per visible GPU on a workstation:</p>
 <pre tabindex="0" role="region" aria-label="Code example"><code class="language-bash">bash infra/train.sh --config recipes/sft.toml --out runs/distributed-jev
 </code></pre>
@@ -156,9 +160,11 @@ release mixtures are documented in <a href="DATA.html">DATA.md</a>.</p>
 <code>NNODES</code>, its distinct <code>NODE_RANK</code>, and <code>MASTER_ADDR</code> to the rank-0 host.
 Mount the same input data, base weights and output directory on all hosts.
 Keep the GPU visibility assigned by the scheduler.</p>
-<p>The launcher defaults to all visible GPUs and prints the process topology.
-Each worker reports its rank, world size, CUDA device and visible device mask.
-When using fewer processes, set <code>PROCESSES_PER_HOST</code> and <code>GPU_SHORTFALL_REASON</code>.
+<p>The launcher defaults to all visible GPUs, or one process when no GPU is visible,
+and prints the process topology. Set <code>PROCESSES_PER_HOST</code> explicitly for CPU
+training, including on hosts with visible GPUs. Each worker reports its rank,
+world size, device and communication backend. CUDA workers also report their
+device binding and visible device mask; training rejects ranks without a visible GPU.
 Check each worker's device binding against the scheduler allocation.</p>
 <p>Allocate resources on your workstation or scheduler before running the launcher.
 Select SFT or RLCR with the same
@@ -186,6 +192,30 @@ W&amp;B logging.</p>
 <code>training_config.json</code>, <code>data_admission.json</code>, and <code>training_metrics.json</code>. If early stopping selects a
 different checkpoint, <code>selection.json</code> records that path; the root directory
 always holds the final weights. Serve the selected path explicitly.</p>
+<h3 id="kubeflow-trainer-progress">Kubeflow Trainer progress</h3>
+<p>From the JevAny source checkout, install the optional integration in the training image:</p>
+<pre tabindex="0" role="region" aria-label="Code example"><code class="language-bash">python -m pip install '.[train,kubeflow]'
+</code></pre>
+<p>Kubeflow Trainer v2.2 or later must have the <code>TrainJobStatus</code> feature gate
+enabled. The controller injects the status endpoint, CA certificate and projected
+token into the training container. JevAny detects this configuration and uses
+the official Kubeflow SDK to report progress, estimated remaining seconds and
+the same structured training and evaluation metrics used by W&amp;B. No change to
+the <code>jevany train</code> command is required, and W&amp;B can remain disabled.</p>
+<p>Only global rank 0 reports status. The percentage uses completed optimizer
+steps and the actual schedule after applying <code>--max-steps</code>; resume retains the
+original step count and estimates remaining time from work done in the current
+process. Updates run in a background thread at five-second intervals, so HTTP
+latency does not block optimizer steps. The SDK handles TLS, rotating credentials
+and reporting errors. Missing SDK dependencies produce a warning when the
+controller configuration is present; reporting failures do not change training
+results. Shutdown allows up to eleven seconds for the final status update.</p>
+<p>Inspect the latest reported status with:</p>
+<pre tabindex="0" role="region" aria-label="Code example"><code class="language-bash">kubectl get trainjob &lt;name&gt; -n &lt;namespace&gt; -o jsonpath='{.status.trainerStatus}'
+</code></pre>
+<p>This status is a latest-value snapshot, not a metric history store. Continue
+using the experiment tracker and saved training artifacts for historical
+analysis. See the <a href="https://trainer.kubeflow.org/en/latest/user-guides/trainjob-progress.html">Kubeflow Trainer progress guide</a>.</p>
 <h3 id="resume-an-interrupted-experiment">Resume an interrupted experiment</h3>
 <p>New checkpoints also contain <code>trainer_state.pt</code> and <code>trainer_state.json</code>.
 They preserve the optimizer, learning-rate scheduler, shuffle order, next batch,

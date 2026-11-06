@@ -154,6 +154,7 @@ jevany train --config recipes/sft.toml
 <p>通过 <code>--data</code> 指定自己的 <a href="DATA.html">JSONL 数据</a>，或用
 <a href="../files/recipes/finetune.toml"><code>recipes/finetune.toml</code></a> 微调已发布的 27B 模型。
 CPU 配置、多模态数据和标准 <code>torchrun</code> 启动方式见<a href="TRAINING.html">训练指南</a>。
+支持 CPU（Gloo）和 CUDA（NCCL）的单机多进程及多机 DDP 训练，CPU 启动方式和资源约束见 <a href="CPU_DISTRIBUTED.html">CPU 分布式训练</a>。
 训练图片/视频模型或微调已发布的 27B 模型时，安装 <code>.[train,multimodal]</code>。</p>
 <p>完成 SFT 后，可用实验性的 <a href="ALGORITHM.html#rlcr">RLCR</a> 继续训练，其奖励兼顾正确率与概率校准：</p>
 <pre tabindex="0" role="region" aria-label="代码示例"><code class="language-bash">jevany train --config recipes/rlcr.toml

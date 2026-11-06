@@ -9,21 +9,17 @@ MASTER_PORT=${MASTER_PORT:-29500}
 # Explicit blocking communicator mode also works with the PyTorch 2.6 CUDA image.
 export TORCH_NCCL_USE_COMM_NONBLOCKING=${TORCH_NCCL_USE_COMM_NONBLOCKING:-0}
 VISIBLE_GPUS=$("$PYTHON_BIN" -c 'import torch; print(torch.cuda.device_count())')
-PROCESSES_PER_HOST=${PROCESSES_PER_HOST:-$VISIBLE_GPUS}
+PROCESSES_PER_HOST=${PROCESSES_PER_HOST:-$((VISIBLE_GPUS > 0 ? VISIBLE_GPUS : 1))}
 
-if (( PROCESSES_PER_HOST < 1 || PROCESSES_PER_HOST > VISIBLE_GPUS )); then
-  echo "PROCESSES_PER_HOST must be between 1 and $VISIBLE_GPUS visible GPUs." >&2
-  exit 2
-fi
-if (( PROCESSES_PER_HOST < VISIBLE_GPUS )) && [[ -z "${GPU_SHORTFALL_REASON:-}" ]]; then
-  echo "Set GPU_SHORTFALL_REASON when using fewer processes than visible GPUs." >&2
+if ! [[ "$PROCESSES_PER_HOST" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PROCESSES_PER_HOST must be a positive integer." >&2
   exit 2
 fi
 if (( NNODES > 1 )) && [[ "$MASTER_ADDR" == 127.0.0.1 ]]; then
   echo "Set MASTER_ADDR to the rank-0 host for multi-node training." >&2
   exit 2
 fi
-echo "hosts=$NNODES visible_gpus_per_host=$VISIBLE_GPUS processes_per_host=$PROCESSES_PER_HOST world_size=$((NNODES * PROCESSES_PER_HOST)) shortfall_reason=${GPU_SHORTFALL_REASON:-none} nccl_nonblocking=$TORCH_NCCL_USE_COMM_NONBLOCKING"
+echo "hosts=$NNODES visible_gpus_per_host=$VISIBLE_GPUS processes_per_host=$PROCESSES_PER_HOST world_size=$((NNODES * PROCESSES_PER_HOST)) nccl_nonblocking=$TORCH_NCCL_USE_COMM_NONBLOCKING"
 exec "$PYTHON_BIN" -m torch.distributed.run \
   --nnodes "$NNODES" --node_rank "$NODE_RANK" \
   --master_addr "$MASTER_ADDR" --master_port "$MASTER_PORT" \

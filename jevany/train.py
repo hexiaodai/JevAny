@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from .checkpoint import Checkpoint, Meta, write_meta
 from .device import allocated_bytes, default_device, empty_cache
+from .kubeflow import KubeflowStatus
 from .data import EVAL_ONLY, augment, load_records, materialize, none_pair, source_seed
 from .suite import ENCODING, digest, load_split, read_manifest, validate_training, write_json
 from .model import (MAX_BRANCH, MAX_PACKED, MAX_STATE, ContextLengthError, DecisionModel,
@@ -471,35 +472,30 @@ def start_wandb(a, out_dir):
 
 def distributed_evaluate_records(records, predictor, evaluation, name, temperature, heldout_sources,
                                  skip_overlong=False):
-    """Run model inference on group-preserving rank shards, then let rank 0 write the canonical benchmark report."""
+    """按完整样本组分片推理，经进程组汇总预测，仅由 rank 0 写入评测报告。"""
     from .benchmark import evaluate_records
 
     rank, world_size = dist.get_rank(), dist.get_world_size()
-    shard_dir = Path(evaluation) / "_distributed" / name
-    if rank == 0:
-        shard_dir.mkdir(parents=True, exist_ok=False)
-    dist.barrier()
     shard = distributed_group_slice(records, rank, world_size)
-    with (shard_dir / f"rank-{rank:03d}.jsonl").open("w", encoding=ENCODING, newline="\n") as output:
-        for record in shard:
-            try:
-                item = {"prediction": predictor(record)}
-            except ContextLengthError as error:
-                if not skip_overlong:
-                    raise
-                item = {"context_error": str(error)}
-            output.write(json.dumps({"id": record["_meta"]["id"], **item}, allow_nan=False) + "\n")
-    dist.barrier()
+    local_predictions = []
+    for record in shard:
+        try:
+            item = {"prediction": predictor(record)}
+        except ContextLengthError as error:
+            if not skip_overlong:
+                raise
+            item = {"context_error": str(error)}
+        local_predictions.append({"id": record["_meta"]["id"], **item})
+    gathered = [None] * world_size if rank == 0 else None
+    dist.gather_object(local_predictions, gathered, dst=0)
     report = rows = None
     if rank == 0:
         predictions = {}
-        for path in sorted(shard_dir.glob("rank-*.jsonl")):
-            with path.open(encoding=ENCODING) as source:
-                for line in source:
-                    item = json.loads(line)
-                    if item["id"] in predictions:
-                        raise ValueError(f"duplicate distributed evaluation record: {item['id']}")
-                    predictions[item["id"]] = item
+        for items in gathered:
+            for item in items:
+                if item["id"] in predictions:
+                    raise ValueError(f"duplicate distributed evaluation record: {item['id']}")
+                predictions[item["id"]] = item
         expected = {record["_meta"]["id"] for record in records}
         if predictions.keys() != expected:
             raise ValueError(f"distributed evaluation coverage mismatch: {len(predictions)}/{len(expected)}")
@@ -655,6 +651,11 @@ def preflight(a):
 
 
 def main(argv=None, *, parser_class=argparse.ArgumentParser):
+    with contextlib.ExitStack() as resources:
+        return _train(argv, parser_class=parser_class, resources=resources)
+
+
+def _train(argv, *, parser_class, resources):
     a = parse_args(argv, parser_class=parser_class)
     manifest, data_summary, inputs = preflight(a)
     if a.dry_run:
@@ -664,23 +665,28 @@ def main(argv=None, *, parser_class=argparse.ArgumentParser):
     dev = a.device or default_device()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if distributed:
-        if dev != "cuda":
-            raise ValueError("distributed training requires CUDA")
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        if not 0 <= local_rank < torch.cuda.device_count():
-            raise ValueError(f"LOCAL_RANK={local_rank} has no CUDA device; launch at most one process per visible GPU")
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
+        if dev == "cpu":
+            dist.init_process_group(backend="gloo")
+        elif dev == "cuda":
+            if not 0 <= local_rank < torch.cuda.device_count():
+                raise ValueError(f"LOCAL_RANK={local_rank} has no CUDA device; launch at most one process per visible GPU")
+            torch.cuda.set_device(local_rank)
+            dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
+        else:
+            raise ValueError("distributed training requires --device cpu or cuda")
+        resources.callback(dist.destroy_process_group)
         rank, world_size = dist.get_rank(), dist.get_world_size()
     else:
         rank = 0
+    topology = {"rank": rank, "local_rank": local_rank, "world_size": world_size, "device": dev,
+                "backend": dist.get_backend() if distributed else None}
     if dev == "cuda":
-        print(json.dumps({"rank": rank, "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
-                          "world_size": world_size, "visible_gpus": torch.cuda.device_count(),
-                          "cuda_device": torch.cuda.current_device(),
-                          "device_name": torch.cuda.get_device_name(),
-                          "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}), flush=True)
+        topology.update(visible_gpus=torch.cuda.device_count(), cuda_device=torch.cuda.current_device(),
+                        device_name=torch.cuda.get_device_name(),
+                        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print(json.dumps(topology), flush=True)
     main_process = rank == 0
     out_dir = Path(a.out)
     import numpy as np
@@ -787,7 +793,7 @@ def main(argv=None, *, parser_class=argparse.ArgumentParser):
     sched = learning_rate_schedule(opt, [group["lr"] for group in groups], steps)
     distributed_forward = None
     if distributed:
-        device_index = torch.cuda.current_device()
+        device_index = torch.cuda.current_device() if dev == "cuda" else None
         distributed_forward = distributed_model(model, device_index)
         torch.manual_seed(a.seed + rank)
     eval_suite = a.eval_suite or a.suite
@@ -816,6 +822,8 @@ def main(argv=None, *, parser_class=argparse.ArgumentParser):
             raise ValueError("resume checkpoint has an invalid training record order")
         restore_rng(resume_state["rank_rng"][rank], rng, dev)
         t0 -= resume_state["elapsed_seconds"]
+
+    status_reporter = resources.enter_context(KubeflowStatus(steps, step)) if main_process else None
 
     def selected_checkpoint():
         if best_checkpoint is None:
@@ -882,11 +890,12 @@ def main(argv=None, *, parser_class=argparse.ArgumentParser):
                 stop = step > 0 and stale_evals >= a.early_stop_patience
             print(f"eval step {step}/{steps} acc {summary['clean']['acc']:.3f} nll {summary['clean']['nll']:.3f} "
                   f"cal_nll {summary['calibrated_clean']['nll']:.3f} T {summary['temperature']:.3f}", flush=True)
+            metrics = wandb_eval_metrics(summary)
+            if a.early_stop_patience:
+                metrics.update({"eval/early_stop_stale_evaluations": stale_evals,
+                                "eval/early_stop_best": best_eval_metric})
+            status_reporter.update(step, metrics)
             if tracker:
-                metrics = wandb_eval_metrics(summary)
-                if a.early_stop_patience:
-                    metrics.update({"eval/early_stop_stale_evaluations": stale_evals,
-                                    "eval/early_stop_best": best_eval_metric})
                 tracker.log(metrics)
         else:
             stop = improved = False
@@ -953,8 +962,9 @@ def main(argv=None, *, parser_class=argparse.ArgumentParser):
                 reduced = reduce_counter(step_run, dev)
                 accumulate_metrics(run, reduced)
                 seen += int(reduced["n"]); tokens_seen += int(reduced["tokens"])
-                if tracker:
-                    tracker.log({"optimizer_step": step, "train/epoch": ep,
+                if main_process:
+                    metrics = {"optimizer_step": step, "train/epoch": ep,
+                                 "train/mode": "rlcr" if a.rlcr else "sft",
                                  "train/objective": reduced["objective"] / reduced["n"],
                                  "train/ce": reduced["ce"] / reduced["n"],
                                  "train/rlcr_policy": reduced["rlcr_policy"] / max(reduced["rlcr_n"], 1),
@@ -966,7 +976,10 @@ def main(argv=None, *, parser_class=argparse.ArgumentParser):
                                  "train/rlcr_sigma": rlcr_sigma,
                                  "train/grad_norm_pre_clip": reduced["grad_norm"] / world_size,
                                  "train/lr": sched.get_last_lr()[0], "train/records_seen": seen,
-                                 "train/forward_tokens": tokens_seen, "train/seconds_per_record": (time.time() - t0) / seen})
+                                 "train/forward_tokens": tokens_seen, "train/seconds_per_record": (time.time() - t0) / seen}
+                    status_reporter.update(step, metrics)
+                    if tracker:
+                        tracker.log(metrics)
                 step_run = Counter()
                 if step % 10 == 0 and main_process:
                     print(f"ep{ep} step {step}/{steps} objective {run['objective']/run['n']:.3f} "
@@ -1020,7 +1033,6 @@ def main(argv=None, *, parser_class=argparse.ArgumentParser):
         # Release cached training buffers on every rank before that happens.
         empty_cache(dev)
         dist.barrier()
-        dist.destroy_process_group()
     return out_dir
 
 

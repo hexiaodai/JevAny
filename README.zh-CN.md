@@ -148,6 +148,7 @@ jevany decide examples/request.json --checkpoint runs/my-jev
 通过 `--data` 指定自己的 [JSONL 数据](https://simplejev.org/JevAny/docs/DATA.html)，或用
 [`recipes/finetune.toml`](recipes/finetune.toml) 微调已发布的 27B 模型。
 CPU 配置、多模态数据和标准 `torchrun` 启动方式见[训练指南](https://simplejev.org/JevAny/docs/TRAINING.html)。
+支持 CPU（Gloo）和 CUDA（NCCL）的单机多进程及多机 DDP 训练，CPU 启动方式和资源约束见 [CPU 分布式训练](https://simplejev.org/JevAny/docs/CPU_DISTRIBUTED.html)。
 训练图片/视频模型或微调已发布的 27B 模型时，安装 `.[train,multimodal]`。
 
 完成 SFT 后，可用实验性的 [RLCR](https://simplejev.org/JevAny/docs/ALGORITHM.html#rlcr) 继续训练，其奖励兼顾正确率与概率校准：
