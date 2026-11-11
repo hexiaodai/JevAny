@@ -261,6 +261,26 @@ The Python entry point `jevany.training.train(config)` accepts `resume` in its
 TOML recipe as well. Invalid settings raise `ValueError`, so notebooks and
 experiment drivers can catch them without exiting the interpreter.
 
+For workloads that restart with the same command, enable automatic recovery:
+
+```bash
+jevany train --base /mnt/base --data /mnt/data/train.jsonl \
+  --out /mnt/output/run --auto-resume --checkpoint-every-steps 40
+```
+
+The first execution requires a new output path. Attempts and checkpoints live
+in `/mnt/output/.run.training/attempt-*`. Each restart locks that execution,
+validates the recipe, input data and world size, and selects the latest complete
+checkpoint into a new attempt. With no checkpoint it starts training again.
+Only global rank 0 selects the attempt; all workers share that decision.
+After training, the model and checkpoints are atomically published to `--out`.
+Restarting an already completed execution reuses that result. If interrupted
+after the last checkpoint but before publication, recovery completes publication
+without taking another optimizer step. Keep the hidden execution directory on
+the same persistent volume; a checkpoint interval of zero can require a full
+rerun after interruption. Automatic recovery does not import an existing run
+that was created without this option.
+
 SFT is the default recipe. RLCR is an experimental continuation with calibration
 rewards. Measure task accuracy and calibration on your own held-out data before selecting
 a checkpoint. See [the objective](ALGORITHM.md) and [release results](EVALUATION.md).

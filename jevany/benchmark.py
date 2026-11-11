@@ -181,7 +181,40 @@ EXAMPLES = """examples:
 --data scores your own labelled JSONL (jevany.data.load_records); --suite scores a
 frozen suite's development partition. Reports land in <out>/report.json, with
 per-question rows in rows.json and raw answers in predictions.jsonl. --out must not
-exist yet. Local scoring needs the 'local' extra; --remote needs no model locally."""
+exist yet. Local scoring needs the 'local' extra; --remote needs no model locally.
+
+Sharded scoring requires an immutable local checkpoint. Run each --shard-index
+with the same --shard-count, --execution-id and --out, then use --aggregate with
+those options to publish <out>/final/report.json. Workers only commit shard files;
+the aggregator recomputes global metrics from their raw predictions."""
+
+
+def evaluation_metadata(a, predictor, choice_options, source_hash, split):
+    """收集模型与数据来源，供单机报告和分片清单复用。"""
+    native_temperature = (getattr(predictor.native_model, "temperature", None)
+                          if choice_options is not None and predictor.native_weight else None)
+    calibration_applied = (None if a.remote else predictor.temperature != 1.0
+                           or native_temperature not in (None, 1.0))
+    metadata = dict(suite_sha256=source_hash, data=a.data, date_facts=a.date_facts, run=a.run or a.remote, split=split,
+                  calibration_applied=calibration_applied,
+                  base_loading=getattr(predictor, "base_loading", None),
+                  remote={"base_url": a.remote, "requested_model": a.remote_model, "served_model": predictor.served_model} if a.remote else None)
+    metadata["calibration"] = {"inference_temperature": getattr(predictor, "temperature", None),
+                               "additional_temperature": 1.0}
+    if not a.remote:
+        metadata["readout"] = normalize_readout(a.readout)
+    if choice_options is not None:
+        choice_readout = dict(predictor.provenance)
+        if native_temperature is not None:
+            choice_readout["native_temperature"] = native_temperature
+            choice_readout["pointer_temperature"] = native_temperature
+            metadata["calibration"]["native_temperature"] = native_temperature
+            metadata["calibration"]["pointer_temperature"] = native_temperature
+        metadata["choice_readout"] = choice_readout
+        # Kept as an output alias for consumers of reports written before the
+        # public readout name changed to ``choice``.
+        metadata["letter_readout"] = dict(choice_readout)
+    return metadata
 
 
 def main(argv=None, prog=None):
@@ -198,7 +231,29 @@ def main(argv=None, prog=None):
     ap.add_argument("--device", choices=["cpu", "mps", "cuda"], default=default_device())
     ap.add_argument("--allow-test", action="store_true")
     ap.add_argument("--date_facts", action="store_true", help="apply jevany.api.with_date_facts to every state before scoring (the opt-in serving preprocessor); reported in report.json")
+    ap.add_argument("--shard-count", type=int, default=int(os.environ.get("EVALUATION_SHARD_COUNT", "1")))
+    ap.add_argument("--shard-index", type=int, default=os.environ.get("EVALUATION_SHARD_INDEX"))
+    ap.add_argument("--execution-id", default=os.environ.get("EVALUATION_RUN_ID", ""))
+    ap.add_argument("--aggregate", action="store_true", help="validate all shards and publish the global report without loading the model")
+    ap.add_argument("--auto-resume", action="store_true",
+                    help="persist predictions across restarts; a single worker also publishes the final report")
+    ap.add_argument("--shard-wait-seconds", type=int, default=60, help="maximum wait for committed shard files to become visible")
     a = ap.parse_args(argv)
+    single = a.auto_resume and not a.aggregate and a.shard_index is None and a.shard_count == 1
+    if single:
+        a.shard_index = 0
+        a.execution_id = a.execution_id or "single"
+    sharded = a.aggregate or a.shard_index is not None
+    if a.shard_count < 1 or a.shard_wait_seconds < 1:
+        ap.error("shard count and visibility timeout must be positive")
+    if a.shard_index is not None and not 0 <= a.shard_index < a.shard_count:
+        ap.error("shard index must be between 0 and shard_count - 1")
+    if a.aggregate and a.shard_index is not None:
+        ap.error("aggregate cannot be combined with a shard index")
+    if a.shard_count > 1 and not sharded:
+        ap.error("multiple shards require a shard index or --aggregate")
+    if sharded and (a.remote or not a.run):
+        ap.error("sharded evaluation requires --run with a local checkpoint")
     try:
         choice_options = choice_options_from_args(a)
     except ValueError as error:
@@ -215,6 +270,13 @@ def main(argv=None, prog=None):
         heldout = read_manifest(a.suite).get("holdout_sources", []); source_hash = digest(Path(a.suite) / "manifest.json")
     if a.date_facts:
         records = [{**r, "state": with_date_facts(r["state"])} for r in records]
+    if sharded:
+        from .evaluation import aggregate_shards, evaluate_shard, execution_identity
+        identity = execution_identity(a, records, source_hash)
+        if a.aggregate:
+            report = aggregate_shards(records, a, identity, tuple(heldout))
+            print(json.dumps({"objective": report["objective"], "clean": report["clean"], "coverage": report["coverage"]}, indent=2))
+            return
     if a.remote:
         predictor = RemotePredictor(a.remote, a.remote_model, os.environ.get("JEVANY_REMOTE_API_KEY", "local"))
     elif choice_options is not None:
@@ -229,28 +291,17 @@ def main(argv=None, prog=None):
         )
     else:
         predictor = LocalPredictor(a.run, a.device, LoadOptions.from_env())
+    if sharded:
+        evaluate_shard(records, predictor, a, identity, evaluation_metadata(a, predictor, choice_options, source_hash, split))
+        if single:
+            report = aggregate_shards(records, a, identity, tuple(heldout))
+            print(json.dumps({"objective": report["objective"], "clean": report["clean"], "coverage": report["coverage"]}, indent=2))
+        return
     report, _ = evaluate_records(records, predictor, a.out, heldout_sources=tuple(heldout), skip_overlong=bool(a.data))
-    native_temperature = (getattr(predictor.native_model, "temperature", None)
-                          if choice_options is not None and predictor.native_weight else None)
-    calibration_applied = (None if a.remote else predictor.temperature != 1.0
-                           or native_temperature not in (None, 1.0))
-    report.update(suite_sha256=source_hash, data=a.data, date_facts=a.date_facts, run=a.run or a.remote, split=split,
-                  calibration_applied=calibration_applied,
-                  base_loading=getattr(predictor, "base_loading", None),
-                  remote={"base_url": a.remote, "requested_model": a.remote_model, "served_model": predictor.served_model} if a.remote else None)
-    if not a.remote:
-        report["readout"] = normalize_readout(a.readout)
-    if choice_options is not None:
-        choice_readout = dict(predictor.provenance)
-        if native_temperature is not None:
-            choice_readout["native_temperature"] = native_temperature
-            choice_readout["pointer_temperature"] = native_temperature
-            report["calibration"]["native_temperature"] = native_temperature
-            report["calibration"]["pointer_temperature"] = native_temperature
-        report["choice_readout"] = choice_readout
-        # Kept as an output alias for consumers of reports written before the
-        # public readout name changed to ``choice``.
-        report["letter_readout"] = dict(choice_readout)
+    metadata = evaluation_metadata(a, predictor, choice_options, source_hash, split)
+    calibration = report["calibration"]
+    calibration.update(metadata.pop("calibration"))
+    report.update(metadata)
     write_json(Path(a.out) / "report.json", report)
     print(json.dumps({"objective": report["objective"], "clean": report["clean"], "coverage": report["coverage"]}, indent=2))
 

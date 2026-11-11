@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
+import uuid
 
 import numpy as np
 import torch
@@ -12,9 +14,74 @@ from .suite import digest, write_json
 
 VERSION = 1
 MUTABLE_SETTINGS = {
-    "config", "dry_run", "out", "resume", "base_load_path", "checkpoint_every_steps",
+    "config", "dry_run", "out", "resume", "auto_resume", "base_load_path", "checkpoint_every_steps",
     "wandb_project", "wandb_name", "wandb_group", "wandb_entity", "wandb_mode",
 }
+
+
+def prepare_training_output(args, inputs, resources, rank, world_size):
+    """主进程锁定输出并选择恢复点，所有 worker 复用同一尝试目录。"""
+    import fcntl
+    import torch.distributed as distributed
+    from .evaluation import commit_json
+
+    output = Path(args.out).resolve()
+    state = output.parent / f".{output.name}.training"
+    selection = [None]
+    if rank == 0:
+        try:
+            state.mkdir(parents=True, exist_ok=True)
+            lock = resources.enter_context((state / "writer.lock").open("a"))
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            configuration = {key: value for key, value in vars(args).items()
+                             if key not in {"out", "config", "dry_run", "auto_resume"}}
+            identity = {"args": configuration, "world_size": world_size,
+                        "inputs": {name: dataset_fingerprint(records) for name, records in inputs.items()}}
+            manifest = state / "execution.json"
+            if manifest.exists():
+                if json.loads(manifest.read_text()) != identity:
+                    raise ValueError("training output belongs to a different configuration or dataset; use a new --out")
+            else:
+                if output.exists():
+                    raise ValueError("--auto-resume requires a new output directory for its first execution")
+                commit_json(manifest, identity)
+            completed = next((path for path in sorted(state.glob("attempt-*"))
+                              if (path / "training_metrics.json").is_file()), None)
+            if completed is not None:
+                selection[0] = {"attempt": str(completed), "completed": True}
+            else:
+                checkpoints = []
+                # 最后一步已保存但最终发布中断时，同样恢复该步以完成发布。
+                for attempt in state.glob("attempt-*"):
+                    for directory in [attempt, *attempt.glob("checkpoints/step-*")]:
+                        if not (directory / "trainer_state.json").is_file() or not (directory / "trainer_state.pt").is_file():
+                            continue
+                        header = read_resume_config(directory)
+                        checkpoints.append((header["optimizer_step"], str(directory)))
+                resume = max(checkpoints, default=(0, args.resume))[1]
+                selection[0] = {"attempt": str(state / f"attempt-{uuid.uuid4().hex}"),
+                                "resume": resume, "completed": False}
+        except Exception as error:
+            selection[0] = {"error": str(error)}
+    if world_size > 1:
+        device = torch.device("cuda", torch.cuda.current_device()) if distributed.get_backend() == "nccl" else None
+        distributed.broadcast_object_list(selection, src=0, device=device)
+    chosen = selection[0]
+    if "error" in chosen:
+        raise ValueError(chosen["error"])
+    if rank == 0:
+        print(json.dumps({"output": str(output), **chosen}), flush=True)
+    return chosen
+
+
+def publish_training_output(attempt, output):
+    """完成后原子发布稳定模型目录，恢复状态与检查点保留在原尝试中。"""
+    output = Path(output).resolve()
+    if output.exists():
+        return
+    staging = output.parent / f".{output.name}-publish-{uuid.uuid4().hex}"
+    shutil.copytree(attempt, staging)
+    os.rename(staging, output)
 
 
 def read_resume_config(directory: str | Path) -> dict:

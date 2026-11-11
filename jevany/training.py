@@ -54,7 +54,8 @@ def train(config: str | Path, *, output_dir: str | Path | None = None) -> Path:
     Paths in recipes resolve from the current working directory, just like CLI
     arguments. Use torchrun for distributed training. Existing runs are never
     overwritten. init_from starts a new optimizer; resume restores the original
-    schedule and requires a new output directory.
+    schedule and requires a new output directory. auto_resume keeps a stable
+    output path and selects persisted attempts when the same command restarts.
 
     Invalid settings raise ValueError; missing input files raise OSError.
     """

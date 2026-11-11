@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from .checkpoint import Checkpoint, Meta, write_meta
 from .device import allocated_bytes, default_device, empty_cache
+from .evaluation import commit_json, distributed_group_slice
 from .kubeflow import KubeflowStatus
 from .data import EVAL_ONLY, augment, load_records, materialize, none_pair, source_seed
 from .suite import ENCODING, digest, load_split, read_manifest, validate_training, write_json
@@ -136,15 +137,6 @@ def learning_rate_schedule(optimizer, max_lrs, steps):
         optimizer, max_lr=max_lrs, total_steps=steps, pct_start=warmup,
     )
 
-
-def distributed_group_slice(records, rank, world_size):
-    """Shard evaluation records without separating contrastive or permutation siblings."""
-    slots = {}
-    for record in records:
-        group = record["_meta"]["group_id"]
-        if group not in slots:
-            slots[group] = len(slots) % world_size
-    return [record for record in records if slots[record["_meta"]["group_id"]] == rank]
 
 
 def reduce_counter(values, device):
@@ -373,6 +365,9 @@ def parse_args(argv=None, *, parser_class=argparse.ArgumentParser):
                                                    "released model's in-domain skill while adapting to a new domain")
     ap.add_argument("--resume", default="", help="continue a local training checkpoint's schedule and optimizer state; "
                                                "use --out for a new output directory")
+    ap.add_argument("--auto_resume", action=argparse.BooleanOptionalAction, default=False,
+                    help="restart the same command using the latest checkpoint and a new attempt directory; "
+                         "publish the completed model to --out")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max_steps", type=int, default=0, help="stop after this many optimizer steps; 0 runs the full schedule")
     ap.add_argument("--eval_before_start", action=argparse.BooleanOptionalAction, default=False,
@@ -400,7 +395,7 @@ def parse_args(argv=None, *, parser_class=argparse.ArgumentParser):
         if set(saved) - known:
             ap.error("resume checkpoint contains unsupported training settings")
         ap.set_defaults(**{key: value for key, value in saved.items()
-                           if key not in ("config", "dry_run", "out", "resume")})
+                           if key not in ("config", "dry_run", "out", "resume", "auto_resume")})
         a = configure_parser(ap, argv)
         validate_resume_settings(vars(a), saved)
     if any(isinstance(value, float) and not math.isfinite(value) for value in vars(a).values()):
@@ -450,7 +445,7 @@ def parse_args(argv=None, *, parser_class=argparse.ArgumentParser):
         ap.error("augmentation probabilities must be in [0, 1]; none/distractor probabilities must sum to at most 1")
     if not a.data and not a.suite:
         ap.error("pass --data or --suite, directly or in --config")
-    if Path(a.out).exists() and int(os.environ.get("RANK", "0")) == 0:
+    if not a.auto_resume and Path(a.out).exists() and int(os.environ.get("RANK", "0")) == 0:
         ap.error("refusing to overwrite an existing run")
     return a
 
@@ -688,6 +683,17 @@ def _train(argv, *, parser_class, resources):
                         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"))
     print(json.dumps(topology), flush=True)
     main_process = rank == 0
+    output = Path(a.out)
+    if a.auto_resume:
+        from .resume import prepare_training_output, publish_training_output
+        execution = prepare_training_output(a, inputs, resources, rank, world_size)
+        if execution["completed"]:
+            if main_process:
+                publish_training_output(execution["attempt"], output)
+            if distributed:
+                dist.barrier()
+            return output
+        a.out, a.resume = execution["attempt"], execution["resume"]
     out_dir = Path(a.out)
     import numpy as np
     torch.manual_seed(a.seed); random.seed(a.seed); np.random.seed(a.seed); rng = random.Random(a.seed)
@@ -758,7 +764,7 @@ def _train(argv, *, parser_class, resources):
     if resume_state:
         if resume_state["total_steps"] != steps:
             raise ValueError("--resume must retain the original optimizer schedule length")
-        if (resume_state["optimizer_step"] >= steps or
+        if not a.auto_resume and (resume_state["optimizer_step"] >= steps or
                 (a.early_stop_patience and resume_state["stale_evals"] >= a.early_stop_patience)):
             raise ValueError("this training schedule has already finished; use --init-from for further training")
         best_checkpoint = resume_state["best_checkpoint"]
@@ -816,6 +822,7 @@ def _train(argv, *, parser_class, resources):
         last_eval_step = resume_state["last_eval_step"]
         best_eval_metric, best_eval_step, best_checkpoint, stale_evals = (
             resume_state[key] for key in ("best_eval_metric", "best_eval_step", "best_checkpoint", "stale_evals"))
+        early_stopped = bool(a.early_stop_patience and stale_evals >= a.early_stop_patience)
         cursor_epoch, cursor_microbatch = resume_state["epoch"], resume_state["next_microbatch"]
         order = resume_state["order"].tolist()
         if len(order) != len(reqs) or sorted(order) != list(range(len(reqs))):
@@ -932,6 +939,8 @@ def _train(argv, *, parser_class, resources):
         run_evaluation()
     start_epoch, start_microbatch = cursor_epoch, cursor_microbatch
     for ep in range(start_epoch, a.epochs):
+        if step >= steps or early_stopped:
+            break
         first_microbatch = start_microbatch if ep == start_epoch else 0
         if first_microbatch == 0:
             rng.shuffle(order)
@@ -1010,7 +1019,7 @@ def _train(argv, *, parser_class, resources):
     peak_rss = reduce_max(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024), dev)
     save_checkpoint(out_dir, step)
     if main_process:
-        write_json(out_dir / "training_metrics.json", {"wall_seconds": time.time() - t0, "records_seen": seen,
+        commit_json(out_dir / "training_metrics.json", {"wall_seconds": time.time() - t0, "records_seen": seen,
                    "requested_records": a.epochs * admission["requested_records"],
                    "input_records": admission["requested_records"], "admitted_records": admission["admitted_records"],
                    "distributed_padding_records": a.epochs * padding_per_epoch,
@@ -1033,6 +1042,12 @@ def _train(argv, *, parser_class, resources):
         # Release cached training buffers on every rank before that happens.
         empty_cache(dev)
         dist.barrier()
+    if a.auto_resume:
+        if main_process:
+            publish_training_output(out_dir, output)
+        if distributed:
+            dist.barrier()
+        return output
     return out_dir
 
 
